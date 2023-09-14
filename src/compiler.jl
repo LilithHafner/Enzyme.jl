@@ -149,6 +149,7 @@ const nofreefns = Set{String}((
     "jl_box_uint64", "jl_box_uint32",
     "ijl_box_uint64", "ijl_box_uint32",
     "ijl_box_char", "jl_box_char",
+    "ijl_subtype",
     "jl_subtype", "julia.get_pgcstack", "jl_in_threaded_region",
     "jl_object_id_", "jl_object_id", "ijl_object_id_", "ijl_object_id",
     "jl_breakpoint",
@@ -214,6 +215,7 @@ const inactivefns = Set{String}((
     "jl_box_uint64", "jl_box_uint32",
     "ijl_box_uint64", "ijl_box_uint32",
     "ijl_box_char", "jl_box_char",
+    "ijl_subtype",
     "jl_subtype", "julia.get_pgcstack", "jl_in_threaded_region",
     "jl_object_id_", "jl_object_id", "ijl_object_id_", "ijl_object_id",
     "jl_breakpoint",
@@ -358,14 +360,14 @@ end
         end
 
         # Allocated inline so adjust first path
-        if allocatedinline(subT)
-            ty |= active_reg_inner(subT, seen)
-        else
-            sub = active_reg_inner(subT, seen)
-            if sub == AnyState
-                continue
-            end
+        sub = active_reg_inner(subT, seen)
+        if sub == AnyState
+            continue
+        end
+        if ismutabletype(T) || !allocatedinline(subT)
             ty |= DupState
+        else
+            ty |= sub
         end
     end
     seen[T] = ty
