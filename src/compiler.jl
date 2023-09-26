@@ -42,6 +42,19 @@ function cpu_features()
     end
 end
 
+import GPUCompiler: @safe_debug, @safe_info, @safe_warn, @safe_error
+
+safe_println(head, tail) =  ccall(:jl_safe_printf, Cvoid, (Cstring, Cstring...), "%s%s\n",head, tail)
+macro safe_show(exs...)
+    blk = Expr(:block)
+    for ex in exs
+        push!(blk.args, :($safe_println($(sprint(Base.show_unquoted, ex)*" = "),
+            repr(begin local value = $(esc(ex)) end))))
+    end
+    isempty(exs) || push!(blk.args, :value)
+    return blk
+end
+
 if LLVM.has_orc_v1()
     include("compiler/orcv1.jl")
 else
@@ -255,52 +268,6 @@ const activefns = Set{String}((
     "jl_",
 ))
 
-
-Enzyme.guess_activity(::Type{T}, mode::Enzyme.Mode) where T = guess_activity(T, convert(API.CDerivativeMode, mode))
-
-@inline function Enzyme.guess_activity(::Type{T}, Mode::API.CDerivativeMode) where {T}
-    if T isa Union
-        if !(guess_activity(T.a, Mode) <: Const) || !(guess_activity(T.b, Mode) <: Const)
-            if Mode == API.DEM_ForwardMode
-                return DuplicatedNoNeed{T}
-            else
-                return Duplicated{T}
-            end
-        end
-    end
-    if isghostty(T) || Core.Compiler.isconstType(T) || T === DataType
-        return Const{T}
-    end
-    if Mode == API.DEM_ForwardMode
-        return DuplicatedNoNeed{T}
-    else
-        return Duplicated{T}
-    end
-end
-
-@inline function Enzyme.guess_activity(::Type{Union{}}, Mode::API.CDerivativeMode)
-    return Const{Union{}}
-end
-
-@inline function Enzyme.guess_activity(::Type{T}, Mode::API.CDerivativeMode) where {T<:Integer}
-    return Const{T}
-end
-
-@inline function Enzyme.guess_activity(::Type{T}, Mode::API.CDerivativeMode) where {T<:AbstractFloat}
-    if Mode == API.DEM_ForwardMode
-        return DuplicatedNoNeed{T}
-    else
-        return Active{T}
-    end
-end
-@inline function Enzyme.guess_activity(::Type{Complex{T}}, Mode::API.CDerivativeMode) where {T<:AbstractFloat}
-    if Mode == API.DEM_ForwardMode
-        return DuplicatedNoNeed{Complex{T}}
-    else
-        return Active{Complex{T}}
-    end
-end
-
 @enum ActivityState begin
     AnyState = 0
     ActiveState = 1
@@ -312,13 +279,11 @@ end
     ActivityState(Int(a1) | Int(a2))
 end
 
+@inline active_reg_inner(::Type{Any}, seen) = DupState
+@inline active_reg_inner(::Type{Complex{Real}}, seen) = DupState
+@inline active_reg_inner(::Type{Real}, seen) = DupState
 @inline active_reg_inner(::Type{Complex{T}}, seen) where {T<:AbstractFloat} = ActiveState
 @inline active_reg_inner(::Type{T}, seen) where {T<:AbstractFloat} = ActiveState
-@inline active_reg_inner(::Type{T}, seen) where {T<:Integer} = AnyState
-@inline active_reg_inner(::Type{T}, seen) where {T<:Function} = AnyState
-@inline active_reg_inner(::Type{T}, seen) where {T<:DataType} = AnyState
-@inline active_reg_inner(::Type{T}, seen) where {T<:Module} = AnyState
-@inline active_reg_inner(::Type{T}, seen) where {T<:AbstractString} = AnyState
 # here we explicity make ref considered dup rather than active
 @inline function active_reg_inner(::Type{<:Union{Ptr{T}, Core.LLVMPtr{T}, Base.RefValue{T}}}, seen) where T
     state = active_reg_inner(T, seen)
@@ -336,16 +301,34 @@ end
 end
 
 @inline function active_reg_inner(::Type{T}, seen) where T
-    if T isa UnionAll || T isa Union || T == Union{}
+    if T ∈ keys(seen)
+        return seen[T]
+    end
+    if EnzymeRules.inactive_type(T)
+        return seen[T] = AnyState
+    end
+    if isghostty(T) || Core.Compiler.isconstType(T)
         return AnyState
+    end
+    if T isa UnionAll
+        return DupState
     end
     # if abstract it must be by reference
     if Base.isabstracttype(T)
         return DupState
     end
-    if T ∈ keys(seen)
-        return seen[T]
+
+    if T isa Union
+        seen[T] = DupState
+        if active_reg_inner(T.a, seen) != AnyState
+            return
+        end
+        if active_reg_inner(T.b, seen) != AnyState
+            return
+        end
+        return seen[T] = AnyState
     end
+
     seen[T] = MixedState
 
     @assert !Base.isabstracttype(T)
@@ -354,10 +337,6 @@ end
     ty = AnyState
     for f in 1:fieldcount(T)
         subT    = fieldtype(T, f)
-
-        if subT isa UnionAll || subT isa Union || subT == Union{} || subT <: Integer
-            continue
-        end
 
         # Allocated inline so adjust first path
         sub = active_reg_inner(subT, seen)
@@ -374,40 +353,38 @@ end
     return ty
 end
 
-@inline @generated function active_reg(::Type{T}) where {T}
-    seen = Dict{DataType, ActivityState}()
-    state = active_reg_inner(T, seen)
+@inline @generated function active_reg_nothrow(::Type{T}) where {T}
+    return active_reg_inner(T, IdDict())
+end
+
+@inline function active_reg(::Type{T}) where {T}
+    state = active_reg_nothrow(T)
     str = string(T)*" has mixed internal activity types"
     @assert state != MixedState str
     return state == ActiveState
 end
 
-@inline @generated function active_reg_nothrow(::Type{T}) where {T}
-    seen = Dict{DataType, ActivityState}()
-    state = active_reg_inner(T, seen)
-    return state == ActiveState
+@inline function guaranteed_const(::Type{T}) where T
+    rt = active_reg_nothrow(T)
+    res = rt == AnyState
+    return res
 end
 
-@inline function Enzyme.guess_activity(::Type{T}, Mode::API.CDerivativeMode) where {T<:AbstractArray}
+Enzyme.guess_activity(::Type{T}, mode::Enzyme.Mode) where T = guess_activity(T, convert(API.CDerivativeMode, mode))
+
+@inline function Enzyme.guess_activity(::Type{T}, Mode::API.CDerivativeMode) where {T}
+    ActReg = active_reg_nothrow(T)
+    if ActReg == AnyState
+        return Const{T}
+    end
     if Mode == API.DEM_ForwardMode
         return DuplicatedNoNeed{T}
     else
-        return Duplicated{T}
-    end
-end
-
-@inline function Enzyme.guess_activity(::Type{Real}, Mode::API.CDerivativeMode)
-    if Mode == API.DEM_ForwardMode
-        return DuplicatedNoNeed{Any}
-    else
-        return Duplicated{Any}
-    end
-end
-@inline function Enzyme.guess_activity(::Type{Any}, Mode::API.CDerivativeMode)
-    if Mode == API.DEM_ForwardMode
-        return DuplicatedNoNeed{Any}
-    else
-        return Duplicated{Any}
+        if ActReg == ActiveState
+            return Active{T}
+        else
+            return Duplicated{T}
+        end
     end
 end
 
@@ -437,18 +414,6 @@ end
 
 using .JIT
 
-import GPUCompiler: @safe_debug, @safe_info, @safe_warn, @safe_error
-
-safe_println(head, tail) =  ccall(:jl_safe_printf, Cvoid, (Cstring, Cstring...), "%s%s\n",head, tail)
-macro safe_show(exs...)
-    blk = Expr(:block)
-    for ex in exs
-        push!(blk.args, :($safe_println($(sprint(Base.show_unquoted, ex)*" = "),
-            repr(begin local value = $(esc(ex)) end))))
-    end
-    isempty(exs) || push!(blk.args, :value)
-    return blk
-end
 
 declare_allocobj!(mod) = get_function!(mod, "julia.gc_alloc_obj") do
     T_jlvalue = LLVM.StructType(LLVM.LLVMType[])
@@ -998,10 +963,7 @@ function array_shadow_handler(B::LLVM.API.LLVMBuilderRef, OrigCI::LLVM.API.LLVMV
 
     anti = call_samefunc_with_inverted_bundles!(b, gutils, orig, vals, valTys, #=lookup=#false)
 
-    prod = LLVM.Value(unsafe_load(Args, 2))
-    for i = 3:numArgs
-        prod = LLVM.mul!(b, prod, LLVM.Value(unsafe_load(Args, i)))
-    end
+    prod = get_array_len(b, anti)
 
     isunboxed = allocatedinline(typ)
 
@@ -1088,6 +1050,27 @@ function get_array_elsz(B, array)
 end
 
 function get_array_len(B, array)
+    if isa(array, LLVM.CallInst)
+        fn = LLVM.called_operand(array)
+        nm = ""
+        if isa(fn, LLVM.Function)
+            nm = LLVM.name(fn)
+        end
+
+        for (fname, num) in (
+                             ("jl_alloc_array_1d", 1), ("ijl_alloc_array_1d", 1),
+                             ("jl_alloc_array_2d", 2), ("jl_alloc_array_2d", 2),
+                             ("jl_alloc_array_2d", 3), ("jl_alloc_array_2d", 3),
+                             )
+            if nm == fname
+                res = operands(array)[2]
+                for i in 2:num
+                    res = mul!(B, res, operands(array)[1+i])
+                end
+                return res
+            end
+        end
+    end
     ST = get_array_struct()
     array = LLVM.pointercast!(B, array, LLVM.PointerType(ST, LLVM.addrspace(LLVM.value_type(array))))
     v = inbounds_gep!(B, ST, array, LLVM.Value[LLVM.ConstantInt(Int32(0)), LLVM.ConstantInt(Int32(1))])
@@ -1141,7 +1124,7 @@ end
 
 function runtime_newtask_fwd(world::Val{World}, fn::FT1, dfn::FT2, post::Any, ssize::Int, ::Val{width}) where {FT1, FT2, World, width}
     FT = Core.Typeof(fn)
-    ghos = isghostty(FT) || Core.Compiler.isconstType(FT)
+    ghos = guaranteed_const(FT)
     forward = thunk(world, (ghos ? Const : Duplicated){FT}, Const, Tuple{}, Val(API.DEM_ForwardMode), Val(width), Val((false,)), #=returnPrimal=#Val(true), #=shadowinit=#Val(false), FFIABI)
     ft = ghos ? Const(fn) : Duplicated(fn, dfn)
     function fclosure()
@@ -1155,7 +1138,7 @@ end
 function runtime_newtask_augfwd(world::Val{World}, fn::FT1, dfn::FT2, post::Any, ssize::Int, ::Val{width}, ::Val{ModifiedBetween}) where {FT1, FT2, World, width, ModifiedBetween}
     # TODO make this AD subcall type stable
     FT = Core.Typeof(fn)
-    ghos = isghostty(FT) || Core.Compiler.isconstType(FT)
+    ghos = guaranteed_const(FT)
     forward, adjoint = thunk(world, (ghos ? Const : Duplicated){FT}, Const, Tuple{}, Val(API.DEM_ReverseModePrimal), Val(width), Val(ModifiedBetween), #=returnPrimal=#Val(true), #=shadowinit=#Val(false), FFIABI)
     ft = ghos ? Const(fn) : Duplicated(fn, dfn)
     taperef = Ref{Any}()
@@ -1257,7 +1240,7 @@ function setup_macro_wraps(forwardMode::Bool, N::Int, Width::Int, base=nothing)
     wrapped = Expr[]
     for i in 1:N
         expr = :(
-                 if ActivityTup[$i+1] && !isghostty($(primtypes[i])) && !Core.Compiler.isconstType($(primtypes[i]))
+                 if ActivityTup[$i+1] && !guaranteed_const($(primtypes[i]))
                    @assert $(primtypes[i]) !== DataType
                     if !$forwardMode && active_reg($(primtypes[i]))
                     Active($(primargs[i]))
@@ -1301,7 +1284,7 @@ function body_runtime_generic_fwd(N, Width, wrapped, primtypes)
 
         dupClosure = ActivityTup[1]
         FT = Core.Typeof(f)
-        if dupClosure && (isghostty(FT) || Core.Compiler.isconstType(FT))
+        if dupClosure && guaranteed_const(FT)
             dupClosure = false
         end
 
@@ -1362,7 +1345,7 @@ function body_runtime_generic_augfwd(N, Width, wrapped, primttypes)
 
         dupClosure = ActivityTup[1]
         FT = Core.Typeof(f)
-        if dupClosure && (isghostty(FT) || Core.Compiler.isconstType(FT))
+        if dupClosure && guaranteed_const(FT)
             dupClosure = false
         end
 
@@ -1469,7 +1452,7 @@ function body_runtime_generic_rev(N, Width, wrapped, primttypes)
 
         dupClosure = ActivityTup[1]
         FT = Core.Typeof(f)
-        if dupClosure && (isghostty(FT) || Core.Compiler.isconstType(FT))
+        if dupClosure && guaranteed_const(FT)
             dupClosure = false
         end
         world = codegen_world_age(FT, tt)
@@ -2080,65 +2063,69 @@ end
 getfield_idx(v, idx) = ccall(:jl_get_nth_field_checked, Any, (Any, UInt), v, idx)
 setfield_idx(v, idx, rhs) = ccall(:jl_set_nth_field, Cvoid, (Any, UInt, Any), v, idx, rhs)
 
-@inline function make_zero(::Type{RT}, seen::IdDict, prev::RT)::RT where {RT<:AbstractFloat}
+@inline function make_zero(::Type{RT}, seen::IdDict, prev::RT, ::Val{copy_if_inactive}=Val(false))::RT where {copy_if_inactive, RT<:AbstractFloat}
     return RT(0)
 end
 
-@inline function make_zero(::Type{Complex{RT}}, seen::IdDict, prev::Complex{RT})::Complex{RT} where {RT<:AbstractFloat}
+@inline function make_zero(::Type{Complex{RT}}, seen::IdDict, prev::Complex{RT}, ::Val{copy_if_inactive}=Val(false))::Complex{RT} where {copy_if_inactive, RT<:AbstractFloat}
     return RT(0)
 end
 
-@inline function make_zero(::Type{RT}, seen::IdDict, prev::RT)::RT where {RT<:Integer}
-    return prev
-end
-
-@inline function make_zero(::Type{RT}, seen::IdDict, prev::RT)::RT where {RT<:Function}
-    return prev
-end
-
-@inline function make_zero(::Type{RT}, seen::IdDict, prev::RT)::RT where {RT<:DataType}
-    return prev
-end
-
-@inline function make_zero(::Type{RT}, seen::IdDict, prev::RT)::RT where {RT<:Module}
-    return prev
-end
-
-@inline function make_zero(::Type{RT}, seen::IdDict, prev::RT)::RT where {RT<:AbstractString}
-    return prev
-end
-
-
-@inline function make_zero(::Type{RT}, seen::IdDict, prev::RT)::RT where {RT<:Tuple}
-    return ((make_zero(a, seen, prev[i]) for (i, a) in enumerate(RT.parameters))...,)
-end
-
-
-@inline function make_zero(::Type{NamedTuple{A,RT}}, seen::IdDict, prev::NamedTuple{A,RT})::NamedTuple{A,RT} where {A,RT}
-    return NamedTuple{A,RT}(make_zero(RT, seen, RT(prev)))
-end
-
-@inline function make_zero(::Type{RT}, seen::IdDict, prev::RT)::RT where {RT}
-    if RT isa UnionAll || RT isa Union || RT == Union{}
-        return prev
+@inline function make_zero(::Type{RT}, seen::IdDict, prev::RT, ::Val{copy_if_inactive}=Val(false))::RT where {copy_if_inactive, RT<:Array}
+    if haskey(seen, prev)
+        return seen[prev]
     end
-    # if RT ∈ keys(seen)
-    #     return seen[RT]
-    # end
-    @assert !ismutable(prev)
+    newa = RT(undef, size(prev))
+    seen[prev] = newa
+    for I in eachindex(prev)
+        pv = prev[I]
+        @inbounds newa[I] = make_zero(Core.Typeof(pv), seen, pv, Val(copy_if_inactive))
+    end
+    return newa
+end
+
+@inline function make_zero(::Type{RT}, seen::IdDict, prev::RT, ::Val{copy_if_inactive}=Val(false))::RT where {copy_if_inactive, RT<:Tuple}
+    return ((make_zero(a, seen, prev[i], Val(copy_if_inactive)) for (i, a) in enumerate(RT.parameters))...,)
+end
+
+
+@inline function make_zero(::Type{NamedTuple{A,RT}}, seen::IdDict, prev::NamedTuple{A,RT}, ::Val{copy_if_inactive}=Val(false))::NamedTuple{A,RT} where {copy_if_inactive, A,RT}
+    return NamedTuple{A,RT}(make_zero(RT, seen, RT(prev), Val(copy_if_inactive)))
+end
+
+@inline function make_zero(::Type{RT}, seen::IdDict, prev::RT, ::Val{copy_if_inactive}=Val(false))::RT where {copy_if_inactive, RT}
+    if guaranteed_const(RT)
+        return copy_if_inactive ? Base.deepcopy_internal(prev, seen) : prev
+    end
+    if haskey(seen, prev)
+        return seen[prev]
+    end
     @assert !Base.isabstracttype(RT)
     @assert Base.isconcretetype(RT)
     nf = fieldcount(RT)
+    
+    if ismutable(prev)
+        y = ccall(:jl_new_struct_uninit, Any, (Any,), RT)
+        seen[prev] = y
+        for i in 1:nf
+            if isdefined(prev, i)
+                xi = getfield(prev, i)
+                xi = make_zero(Core.Typeof(xi), seen, xi, Val(copy_if_inactive))
+                ccall(:jl_set_nth_field, Cvoid, (Any, Csize_t, Any), y, i-1, xi)
+            end
+        end
+        return y
+    end
+    
     if nf == 0
         return prev
     end
-    # @assert !isbitstype(RT)
 
     flds = Vector{Any}(undef, nf)
     for i in 1:nf
         if isdefined(prev, i)
             xi = getfield(prev, i)
-            xi = make_zero(Core.Typeof(xi), seen, xi)
+            xi = make_zero(Core.Typeof(xi), seen, xi, Val(copy_if_inactive))
             flds[i] = xi
         else
             nf = i - 1 # rest of tail must be undefined values
@@ -2146,6 +2133,7 @@ end
         end
     end
     y = ccall(:jl_new_structv, Any, (Any, Ptr{Any}, UInt32), RT, flds, nf)
+    seen[prev] = y
     return y
 end
 
@@ -2623,6 +2611,9 @@ function common_apply_iterate_fwd(offset, B, orig, gutils, normalR, shadowR)
             shadow = LLVM.UndefValue(ST)
             for i in 1:width
                 shadow = insert_value!(B, shadow, cal, i-1)
+                if i == 1
+                    API.moveBefore(cal, shadow, B)
+                end
             end
         end
         unsafe_store!(shadowR, shadow.ref)
@@ -2646,6 +2637,9 @@ function common_apply_iterate_augfwd(offset, B, orig, gutils, normalR, shadowR, 
             shadow = LLVM.UndefValue(ST)
             for i in 1:width
                 shadow = insert_value!(B, shadow, cal, i-1)
+                if i == 1
+                    API.moveBefore(cal, shadow, B)
+                end
             end
         end
         unsafe_store!(shadowR, shadow.ref)
@@ -3037,8 +3031,9 @@ function emit_error(B::LLVM.IRBuilder, orig, string)
     end
 
     # 2. Call error function and insert unreachable
-    call!(B, funcT, func, LLVM.Value[globalstring_ptr!(B, string)])
-
+    ct = call!(B, funcT, func, LLVM.Value[globalstring_ptr!(B, string)])
+    LLVM.API.LLVMAddCallSiteAttribute(ct, LLVM.API.LLVMAttributeFunctionIndex, EnumAttribute("noreturn"))
+    return ct
     # FIXME(@wsmoses): Allow for emission of new BB in this code path
     # unreachable!(B)
 
@@ -3285,7 +3280,7 @@ end
     width = get_width(gutils)
 
     ops = collect(operands(orig))[1:end-1]
-    dupClosure = !isghostty(funcT) && !Core.Compiler.isconstType(funcT) && !is_constant_value(gutils, ops[1])
+    dupClosure = !guaranteed_const(funcT) && !is_constant_value(gutils, ops[1])
     pdupClosure = dupClosure
 
     subfunc = nothing
@@ -3307,28 +3302,9 @@ end
         subfunc = functions(mod)[fwdmodenm]
 
     elseif mode == API.DEM_ReverseModePrimal || mode == API.DEM_ReverseModeGradient
-
-        # TODO can optimize to only do if could contain a float
         if dupClosure
-            has_active = false
-            todo = Type[funcT]
-            while length(todo) != 0
-                T = pop!(todo)
-                if !allocatedinline(T)
-                    continue
-                end
-                if fieldcount(T) == 0
-                    if T <: Integer
-                        continue
-                    end
-                    has_active = true
-                    break
-                end
-                for f in 1:fieldcount(T)
-                    push!(todo, fieldtype(T, f))
-                end
-            end
-
+            ty = active_reg_nothrow(funcT)
+            has_active = ty == MixedState || ty == ActiveState
             if has_active
                 refed = true
                 e_tt = Tuple{Duplicated{Base.RefValue{funcT}}, e_tt.parameters...}
@@ -3924,7 +3900,7 @@ function enzyme_custom_setup_args(B, orig, gutils, mi, RT, reverse, isKWCall)
     for arg in jlargs
         @assert arg.cc != RemovedParam
         if arg.cc == GPUCompiler.GHOST
-            @assert isghostty(arg.typ) || Core.Compiler.isconstType(arg.typ)
+            @assert guaranteed_const(arg.typ)
             if isKWCall && arg.arg_i == 2
                 Ty = arg.typ
                 kwtup = Ty
@@ -4100,7 +4076,7 @@ function enzyme_custom_setup_ret(gutils, orig, mi, RealRt)
     if sret !== nothing
         activep = API.EnzymeGradientUtilsGetDiffeType(gutils, operands(orig)[1], #=isforeign=#false)
         needsPrimal = activep == API.DFT_DUP_ARG || activep == API.DFT_CONSTANT
-        needsShadowP[] = false
+        needsShadowP[] = activep == API.DFT_DUP_ARG || activep == API.DFT_DUP_NONEED
     end
 
     if !needsPrimal && activep == API.DFT_DUP_ARG
@@ -5909,11 +5885,34 @@ function julia_error(cstr::Cstring, val::LLVM.API.LLVMValueRef, errtype::API.Err
                 if isa(ce, ConstantInt)
                     ptr = reinterpret(Ptr{Cvoid}, convert(UInt, ce))
                     typ = Base.unsafe_pointer_to_objref(ptr)
-                    if isghostty(Core.Typeof(typ))
+                    TT = Core.Typeof(typ)
+                    if guaranteed_const(TT)
                         continue
                     end
-                    badval = typ
-                    illegal = false
+                    badval = string(typ)*" of type"*" "*string(TT)
+                    illegal = true
+                    break
+                end
+            end
+            if isa(cur, LLVM.LoadInst)
+                ptr = operands(cur)[1]
+                ce = ptr
+                while isa(ce, ConstantExpr)
+                    if opcode(ce) == LLVM.API.LLVMAddrSpaceCast ||  opcode(ce) == LLVM.API.LLVMIntToPtr
+                        ce = operands(ce)[1]
+                    else
+                        break
+                    end
+                end
+                if isa(ce, ConstantInt)
+                    ptr = unsafe_load(reinterpret(Ptr{Ptr{Cvoid}}, convert(UInt, ce)))
+                    typ = Base.unsafe_pointer_to_objref(ptr)
+                    TT = Core.Typeof(typ)
+                    if guaranteed_const(TT)
+                        continue
+                    end
+                    badval = string(typ)*" of type"*" "*string(TT)
+                    illegal = true
                     break
                 end
             end
@@ -5984,7 +5983,7 @@ function julia_error(cstr::Cstring, val::LLVM.API.LLVMValueRef, errtype::API.Err
             println(io, Base.unsafe_string(st))
             API.EnzymeStringFree(st)
             if badval !== nothing
-                println(io, " value="*string(badval))
+                println(io, " value="*badval)
             end
             println(io, "You may be using a constant variable as temporary storage for active memory (https://enzyme.mit.edu/julia/stable/#Activity-of-temporary-storage). If not, please open an issue, and either rewrite this variable to not be conditionally active or use Enzyme.API.runtimeActivity!(true) as a workaround for now")
             if bt !== nothing
@@ -6690,6 +6689,11 @@ function __init__()
         @cfunction(array_shadow_handler, LLVM.API.LLVMValueRef, (LLVM.API.LLVMBuilderRef, LLVM.API.LLVMValueRef, Csize_t, Ptr{LLVM.API.LLVMValueRef}, API.EnzymeGradientUtilsRef)),
         @cfunction(null_free_handler, LLVM.API.LLVMValueRef, (LLVM.API.LLVMBuilderRef, LLVM.API.LLVMValueRef, LLVM.API.LLVMValueRef))
     )
+    register_alloc_handler!(
+        ("jl_new_array", "ijl_new_array"),
+        @cfunction(array_shadow_handler, LLVM.API.LLVMValueRef, (LLVM.API.LLVMBuilderRef, LLVM.API.LLVMValueRef, Csize_t, Ptr{LLVM.API.LLVMValueRef}, API.EnzymeGradientUtilsRef)),
+        @cfunction(null_free_handler, LLVM.API.LLVMValueRef, (LLVM.API.LLVMBuilderRef, LLVM.API.LLVMValueRef, LLVM.API.LLVMValueRef))
+    )
     register_handler!(
         ("julia.call",),
         @augfunc(jlcall_augfwd),
@@ -6883,9 +6887,7 @@ function __init__()
         @fwdfunc(jl_array_ptr_copy_fwd),
     )
     register_handler!(
-        ("jl_uv_associate_julia_struct","uv_async_init","cuLaunchHostFunc","uv_timer_init","uv_timer_start","jl_array_del_beg","ijl_array_del_beg","jl_array_grow_beg","ijl_array_grow_beg","cublasDgemm_v2", "cublasDscal_v2", "ijl_call_in_typeinf_world", "jl_call_in_typeinf_world",
-         "dpotrf_64_", "dpotrf_", "dtrtrs_64_", "dtrtrs_", "dgetrf_64_", "dgetrf_", "dgetrs_", "dgetrs_64_", "dtzrzf_", "dtzrzf_64_", "dormqr_", "dormqr_64_", "dormrz_", "dormrz_64_", "dlaic1_", "dlaic1_64_", "dgeqp3_", "dgeqp3_64_",
-         "cholmod_l_start", "dgetri_64_", "dgetri_", "nc_sync"),
+        (),
         @augfunc(jl_unhandled_augfwd),
         @revfunc(jl_unhandled_rev),
         @fwdfunc(jl_unhandled_fwd),
@@ -9767,7 +9769,7 @@ function _thunk(job, postopt::Bool=true)
         add!(pm, FunctionPass("ReinsertGCMarker", reinsert_gcmarker_pass!))
         run!(pm, mod)
     end
-    
+
     # Run post optimization pipeline
     if postopt && job.config.params.ABI <: FFIABI
         post_optimze!(mod, JIT.get_tm())
@@ -9823,8 +9825,8 @@ end
             error("Function to differentiate `$mi` is guaranteed to return an error and doesn't make sense to autodiff. Giving up")
         end
         
-        if !(A <: Const) && (isghostty(rrt) || Core.Compiler.isconstType(rrt) || rrt === DataType)
-            error("Return type `$rrt` not marked Const, but is ghost or const type.")
+        if !(A <: Const) && guaranteed_const(rrt)
+            error("Return type `$rrt` not marked Const, but type is guaranteed to be constant")
         end
 
         if A isa UnionAll
@@ -9835,12 +9837,6 @@ end
             # @assert eltype(A) == rrt
             rt = A
         end
-
-        if rrt == Nothing && !(A <: Const)
-            error("Return of nothing must be marked Const")
-        end
-
-        # @assert isa(rrt, DataType)
 
         # We need to use primal as the key, to lookup the right method
         # but need to mixin the hash of the adjoint to avoid cache collisions
